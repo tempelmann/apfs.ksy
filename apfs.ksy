@@ -5,17 +5,37 @@ meta:
   endian: le
 
 seq:
- - id: blocks
-   type: block
-   size: block_size
-   repeat: until
-   repeat-until: _io.size - _io.pos < block_size
+  - id: block0
+    type: block
+    size: 4096
 
 instances:
   block_size:
-    value: 4096
+    value: _root.block0.body.as<containersuperblock>.block_size
+#  random_block:
+#    pos: 0 * block_size   # enter block number here to jump directly that block in the WebIDE
+#    type: block           # opens a sub stream for making positioning inside the block work
+#    size: block_size
 
 types:
+
+# block navigation
+
+  ref_block:
+    doc: |
+      Universal type to address a block: it both parses one u8-sized
+      block address and provides a lazy instance to parse that block
+      right away.
+    seq:
+      - id: value
+        type: u8
+    instances:
+      target:
+        io: _root._io
+        pos: value * _root.block_size
+        type: block
+        size: _root.block_size
+    -webide-representation: 'Blk {value:dec}'
 
 # meta structs
 
@@ -47,13 +67,13 @@ types:
       - id: header
         type: block_header
       - id: body
-        size-eos: true
+        #size-eos: true
         type:
           switch-on: header.type_block
           cases:
             block_type::containersuperblock: containersuperblock
-            block_type::node_2: node
-            block_type::node_3: node
+            block_type::rootnode: node
+            block_type::node: node
             block_type::spaceman: spaceman
             block_type::allocationinfofile: allocationinfofile
             block_type::btree: btree
@@ -91,7 +111,7 @@ types:
       - id: spaceman_id
         type: u8
       - id: block_map_block
-        type: u8
+        type: ref_block
       - id: unknown_168_id
         type: u8
       - id: padding2
@@ -107,11 +127,11 @@ types:
 
   node:
     seq:
-      - id: type_node
+      - id: type_flags
         type: u2
-        enum: node_type
-      - id: unknown_34
+      - id: leaf_distance
         type: u2
+        doc: Zero for leaf nodes, > 0 for branch nodes
       - id: num_entries
         type: u4
       - id: unknown_40
@@ -123,72 +143,13 @@ types:
       - id: ofs_data
         type: u2
       - id: meta_entry
-        type: entry_header
+        type: full_entry_header
       - id: entries
-        type:
-          switch-on: type_node
-          cases:
-            node_type::flex_1: flex_entry
-            node_type::flex_2: flex_entry
-            node_type::flex_3: flex_entry
-            node_type::fixed: fixed_entry
+        type: node_entry
         repeat: expr
         repeat-expr: num_entries
 
-## node entries
-
-  flex_entry:
-    seq:
-      - id: header
-        type: entry_header
-    instances:
-      key:
-        pos: header.ofs_key + _parent.ofs_keys + 56
-        type: flex_key
-      block_id:
-        pos: '_root.block_size - header.ofs_data - 40 * ((_parent.type_node != node_type::flex_2) ? 1 : 0)'
-        if: _parent.type_node == node_type::flex_1
-        type: u8
-      record:
-        pos: '_root.block_size - header.ofs_data - 40 * ((_parent.type_node != node_type::flex_2) ? 1 : 0)'
-        if: _parent.type_node != node_type::flex_1
-        size: header.len_data
-        type:
-          switch-on: key.type_entry
-          cases:
-            entry_type::name: flex_named_record
-            entry_type::thread: flex_thread_record
-            entry_type::idpair: flex_idpair_record
-            entry_type::entry_60: flex_60_record
-            entry_type::extent: flex_extent_record
-            entry_type::entry_c0: flex_c0_record
-            entry_type::extattr: flex_extattr_record
-
-  fixed_entry:
-    seq:
-      - id: header
-        type: fixed_entry_header
-    instances:
-      key:
-        pos: header.ofs_key + _parent.ofs_keys + 56
-        size: _parent.meta_entry.len_key
-        type:
-          switch-on: _parent._parent.header.type_content
-          cases:
-            content_type::history: fixed_history_key
-            content_type::location: fixed_loc_key
-      record:
-        pos: _root.block_size - header.ofs_data - 40
-        size: _parent.meta_entry.len_data
-        type:
-          switch-on: _parent._parent.header.type_content
-          cases:
-            content_type::history: fixed_history_record
-            content_type::location: fixed_loc_record
-
-## node entry header
-
-  entry_header:
+  full_entry_header:
     seq:
       - id: ofs_key
         type: s2
@@ -199,74 +160,100 @@ types:
       - id: len_data
         type: u2
 
-  fixed_entry_header:
+  dynamic_entry_header:
     seq:
       - id: ofs_key
         type: s2
+      - id: len_key
+        type: u2
+        if: (_parent._parent.type_flags & 4) == 0
       - id: ofs_data
         type: s2
+      - id: len_data
+        type: u2
+        if: (_parent._parent.type_flags & 4) == 0
 
-## node fixed entry keys
+## node entries
 
-  fixed_loc_key:
+  node_entry:
     seq:
-      - id: block_id
-        type: u8
-      - id: unknown_8
-        type: u8
+      - id: header
+        type: dynamic_entry_header
+    instances:
+      key:
+        pos: header.ofs_key + _parent.ofs_keys + 56
+        type: key
+        -webide-parse-mode: eager
+      data:
+        pos: _root.block_size - header.ofs_data - 40 * (_parent.type_flags & 1)
+        type:
+          switch-on: '(((_parent.type_flags & 2) == 0) ? 256 : 0) + key.type_entry.to_i * (((_parent.type_flags & 2) == 0) ? 0 : 1)'
+          cases:
+            256: pointer_record # applies to all pointer records, i.e. any entry data in index nodes
+            entry_type::location.to_i: location_record
+            entry_type::inode.to_i: inode_record
+            entry_type::name.to_i: named_record
+            entry_type::thread.to_i: thread_record
+            entry_type::hardlink.to_i: hardlink_record
+            entry_type::entry6.to_i: t6_record
+            entry_type::extent.to_i: extent_record
+            entry_type::entry12.to_i: t12_record
+            entry_type::extattr.to_i: extattr_record
+        -webide-parse-mode: eager
+    -webide-representation: '{key}: {data}'
 
-  fixed_history_key:
+## node entry keys
+
+  key:
     seq:
-      - id: version
-        type: u8
-      - id: block
-        type: u8
-
-## node fixed entry records
-
-  fixed_loc_record:
-    seq:
-      - id: unknown_0
+      - id: key_low # this is a work-around for JavaScript's inability to hande 64 bit values
         type: u4
-      - id: unknown_4
+      - id: key_high
         type: u4
-      - id: block
-        type: u8
-
-  fixed_history_record:
-    seq:
-      - id: unknown_0
-        type: u4
-      - id: unknown_4
-        type: u4
-
-## node flex entry keys
-
-  flex_key:
-    seq:
-      - id: parent_id
-        type: u4
-      - id: type0
-        type: u1
-      - id: type1
-        type: u1
-      - id: type2
-        type: u1
-      - id: type_entry
-        type: u1
-        enum: entry_type
       - id: content
-        size: _parent.header.len_key
+        #size: _parent.header.len_key-8
         type:
           switch-on: type_entry
           cases:
-            entry_type::name: flex_named_key
-            entry_type::idpair: flex_idpair_key
-            entry_type::extattr: flex_named_key
-            entry_type::extent: flex_extent_key
-            entry_type::location: flex_location_key
+            entry_type::location: location_key
+            entry_type::inode: inode_key
+            entry_type::name: named_key
+            entry_type::hardlink: hardlink_key
+            entry_type::extattr: named_key
+            entry_type::extent: extent_key
+    instances:
+      key_value:
+        value: key_low + ((key_high & 0x0FFFFFFF) << 32)
+        -webide-parse-mode: eager
+      type_entry:
+        value: key_high >> 28
+        enum: entry_type
+        -webide-parse-mode: eager
+    -webide-representation: '({type_entry}) {key_value:dec} {content}'
 
-  flex_named_key:
+  location_key:
+    seq:
+      - id: block_id
+        type: u8
+      - id: version
+        type: u8
+    -webide-representation: 'ID {block_id:dec} v{version:dec}'
+
+  history_key:
+    seq:
+      - id: version
+        type: u8
+      - id: block_num
+        type: ref_block
+    -webide-representation: '{block_num} v{version:dec}'
+
+  inode_key:
+    seq:
+      - id: block_num
+        type: ref_block
+    -webide-representation: '{block_num}'
+
+  named_key:
     seq:
       - id: len_name
         type: u1
@@ -278,27 +265,47 @@ types:
       - id: dirname
         size: len_name
         type: strz
+    -webide-representation: '"{dirname}"'
 
-  flex_idpair_key:
-    seq:
-      - id: id2
-        type: u4
-      - id: id3
-        type: u4
-
-  flex_extent_key:
+  hardlink_key:
     seq:
       - id: id2
         type: u8
+    -webide-representation: '#{id2:dec}'
 
-  flex_location_key:
+  extent_key:
     seq:
-      - id: version
+      - id: offset # seek pos in file
         type: u8
+    -webide-representation: '{offset:dec}'
 
-## node flex entry records
+## node entry records
 
-  flex_thread_record: # 0x30
+  pointer_record: # for any index nodes
+    seq:
+      - id: pointer
+        type: u8
+    -webide-representation: '-> {pointer:dec}'
+
+  history_record: # ???
+    seq:
+      - id: unknown_0
+        type: u4
+      - id: unknown_4
+        type: u4
+    -webide-representation: '{unknown_0}, {unknown_4}'
+
+  location_record: # 0x00
+    seq:
+      - id: block_start
+        type: u4
+      - id: block_length
+        type: u4
+      - id: block_num
+        type: ref_block
+    -webide-representation: '{block_num}, from {block_start:dec}, len {block_length:dec}'
+
+  thread_record: # 0x30
     seq:
       - id: node_id
         type: u8
@@ -308,31 +315,42 @@ types:
         type: u8
         repeat: expr
         repeat-expr: 4
-      - id: unk_48
+      - id: flags
+        type: u4
+      - id: unknown_52
+        type: u4
+      - id: unknown_56
         type: u8
-      - id: unk_56
+      - id: unknown_64
         type: u8
-      - id: unk_64
-        type: u8
-      - id: unk_72
-        type: u8
+      - id: owner_id
+        type: u4
+      - id: group_id
+        type: u4
       - id: access
-        type: u8
+        type: u4
+      - id: unknown_84
+        type: u4
       - id: unknown_88
-        type: u8
-      - id: block_id
+        type: u4
+      - id: filler_flag
+        type: u2
+      - id: unknown_94
+        type: u2
+      - id: unknown_96
         type: u2
       - id: len_name
         type: u2
       - id: name_filler
         type: u4
-        if: unk_64 > 2
+        if: filler_flag == 2
       - id: name
         type: strz
-      - id: unk_remainder
+      - id: unknown_remainder
         size-eos: true
+    -webide-representation: '#{node_id:dec} / #{parent_id:dec} "{name}"'
 
-  flex_idpair_record: # 0x50
+  hardlink_record: # 0x50
     seq:
       - id: node_id
         type: u8
@@ -341,20 +359,39 @@ types:
       - id: dirname
         size: namelength
         type: str
+    -webide-representation: '#{node_id:dec} "{dirname}"'
 
-  flex_60_record: # 0x60
+  t6_record: # 0x60
     seq:
       - id: unknown_0
         type: u4
+    -webide-representation: '{unknown_0}'
 
-  flex_extent_record: # 0x80
+  inode_record: # 0x20
+    seq:
+      - id: block_count
+        type: u4
+      - id: unknown_4
+        type: u2
+      - id: block_size
+        type: u2
+      - id: inode
+        type: u8
+      - id: unknown_16
+        type: u4
+    -webide-representation: '#{inode:dec}, Cnt {block_count:dec} * {block_size:dec}, {unknown_4:dec}, {unknown_16:dec}'
+  
+  extent_record: # 0x80
     seq:
       - id: size
         type: u8
-      - id: block
+      - id: block_num
+        type: ref_block
+      - id: unknown_16
         type: u8
+    -webide-representation: '{block_num}, Len {size:dec}, {unknown_16:dec}'
 
-  flex_named_record: # 0x90
+  named_record: # 0x90
     seq:
       - id: node_id
         type: u8
@@ -363,13 +400,15 @@ types:
       - id: type_item
         type: u2
         enum: item_type
+    -webide-representation: '#{node_id:dec}, {type_item}'
 
-  flex_c0_record: # 0xc0
+  t12_record: # 0xc0
     seq:
       - id: unknown_0
         type: u8
+    -webide-representation: '{unknown_0:dec}'
 
-  flex_extattr_record: # 0x40
+  extattr_record: # 0x40
     seq:
       - id: type_ea
         type: u2
@@ -383,6 +422,7 @@ types:
           cases:
             ea_type::symlink: strz # symlink
             # all remaining cases are handled as a "bunch of bytes", thanks to the "size" argument
+    -webide-representation: '{type_ea} {data}'
 
 
 # spaceman (type: 0x05)
@@ -453,7 +493,7 @@ types:
       - id: unknown_0
         size: 16
       - id: root
-        type: u8
+        type: ref_block
 
 # checkpoint (type: 0x0c)
 
@@ -489,7 +529,7 @@ types:
       - id: block_id
         type: u8
       - id: block
-        type: u8
+        type: ref_block
 
 # volumesuperblock (type: 0x0d)
 
@@ -501,28 +541,31 @@ types:
       - id: unknown_36
         size: 92
       - id: block_map_block
-        type: u8
+        type: ref_block
+        doc: 'Maps node IDs to the inode Btree nodes'
       - id: root_dir_id
         type: u8
-      - id: unknown_144_id
-        type: u8
-      - id: unknown_152_id
-        type: u8
+      - id: inode_map_block
+        type: ref_block
+        doc: 'Maps file extents to inodes'
+      - id: unknown_152_blk
+        type: ref_block
       - id: unknown_160
         size: 80
       - id: volume_guid
         size: 16
-      - id: time_256
+      - id: time_updated
         type: u8
       - id: unknown_264
         type: u8
-      - id: unknown_272
+      - id: created_by
         size: 32
-      - id: time_304
+        type: strz
+      - id: time_created
         type: u8
       - id: unknown_312
         size: 392
-      - id: name
+      - id: volume_name
         type: strz
 
 # enums
@@ -531,8 +574,8 @@ enums:
 
   block_type:
     1: containersuperblock
-    2: node_2
-    3: node_3
+    2: rootnode
+    3: node
     5: spaceman
     7: allocationinfofile
     11: btree
@@ -541,34 +584,28 @@ enums:
     17: unknown
 
   entry_type:
-    0x00: location
-    0x20: volume
-    0x30: thread
-    0x40: extattr
-    0x50: idpair
-    0x60: entry_60
-    0x80: extent
-    0x90: name
-    0xc0: entry_c0
-
-  node_type:
-    0x01: flex_1
-    0x02: flex_2
-    0x03: flex_3
-    0x07: fixed
+    0x0: location
+    0x2: inode
+    0x3: thread
+    0x4: extattr
+    0x5: hardlink
+    0x6: entry6
+    0x8: extent
+    0x9: name
+    0xc: entry12
 
   content_type:
     0: empty
     9: history
     11: location
     14: files
-    15: unknown2
+    15: extents
     16: unknown3
 
   item_type:
     4: folder
     8: file
-    10: type_10
+    10: symlink
 
   ea_type:
     2: generic
